@@ -1,4 +1,27 @@
-const { getUserModel, getAppointmentModel, getAIAnalysisModel, getReportModel } = require('../utils/modelHelper.js');
+const { getUserModel, getAppointmentModel, getAIAnalysisModel, getReportModel, aggregateInMemory } = require('../utils/modelHelper.js');
+const { getStorageMode } = require('../config/database.js');
+const logger = require('../utils/logger.js');
+
+
+const TTL_MS = 5 * 60 * 1000; // 5 minutes
+const statsCache = new Map(); 
+
+const getCached = (key) => {
+  const entry = statsCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    statsCache.delete(key);
+    return null;
+  }
+  return entry.data;
+};
+
+const setCache = (key, data) => {
+  statsCache.set(key, { data, expiresAt: Date.now() + TTL_MS });
+};
+
+const clearStatsCache = () => statsCache.clear();
+
 
 const getUsers = async (req, res, next) => {
   try {
@@ -128,36 +151,80 @@ const getDashboardStats = async (req, res, next) => {
     const userId = req.user.id;
     const role = req.user.role;
 
-    let stats = {};
+    const cacheKey = role === 'admin' ? 'stats:admin' : `stats:${role}:${userId}`;
+    const cached = getCached(cacheKey);
+
+    if (cached) {
+      logger.info('Stats cache hit', { cacheKey, userId });
+      return res.json({ success: true, stats: cached, fromCache: true });
+    }
 
     const User = getUserModel();
     const Appointment = getAppointmentModel();
     const AIAnalysis = getAIAnalysisModel();
-    
-    if (role === 'admin') {
-      const totalUsers = await User.countDocuments();
-      const totalPatients = await User.countDocuments({ role: 'patient' });
-      const totalDoctors = await User.countDocuments({ role: 'doctor' });
-      const totalAppointments = await Appointment.countDocuments();
-      const totalAnalyses = await AIAnalysis.countDocuments();
-      const pendingAppointments = await Appointment.countDocuments({ status: 'pending' });
+    const Report = getReportModel();
+    const useInMemory = getStorageMode();
 
-      stats = {
-        totalUsers,
-        totalPatients,
-        totalDoctors,
-        totalAppointments,
-        totalAnalyses,
-        pendingAppointments
-      };
+    let stats = {};
+
+    if (role === 'admin') {
+      if (useInMemory) {
+        // In-memory: parallel counts using aggregation helper
+        const [
+          totalUsers, totalPatients, totalDoctors,
+          totalAppointments, totalAnalyses, pendingAppointments
+        ] = await Promise.all([
+          User.countDocuments({}),
+          User.countDocuments({ role: 'patient' }),
+          User.countDocuments({ role: 'doctor' }),
+          Appointment.countDocuments({}),
+          AIAnalysis.countDocuments({}),
+          Appointment.countDocuments({ status: 'pending' })
+        ]);
+        stats = { totalUsers, totalPatients, totalDoctors, totalAppointments, totalAnalyses, pendingAppointments };
+      } else {
+        // MongoDB: single aggregation pipeline — one DB round-trip for user counts
+        const [userAgg, totalAppointments, totalAnalyses, pendingAppointments] = await Promise.all([
+          User.aggregate([
+            {
+              $group: {
+                _id: '$role',
+                count: { $sum: 1 }
+              }
+            }
+          ]),
+          Appointment.countDocuments(),
+          AIAnalysis.countDocuments(),
+          Appointment.countDocuments({ status: 'pending' })
+        ]);
+
+        const roleCounts = userAgg.reduce((acc, { _id, count }) => {
+          acc[_id] = count;
+          return acc;
+        }, {});
+
+        stats = {
+          totalUsers: Object.values(roleCounts).reduce((a, b) => a + b, 0),
+          totalPatients: roleCounts.patient || 0,
+          totalDoctors: roleCounts.doctor || 0,
+          totalAppointments,
+          totalAnalyses,
+          pendingAppointments
+        };
+      }
+
     } else if (role === 'doctor') {
-      const Appointment = getAppointmentModel();
-      const AIAnalysis = getAIAnalysisModel();
-      const myAppointments = await Appointment.countDocuments({ doctor: userId });
-      const pendingAppointments = await Appointment.countDocuments({ doctor: userId, status: 'pending' });
-      const completedAppointments = await Appointment.countDocuments({ doctor: userId, status: 'completed' });
-      const myAnalyses = await AIAnalysis.countDocuments({ doctor: userId });
-      const myPatients = await Appointment.distinct('patient', { doctor: userId });
+      // All doctor queries are filtered by userId — already efficient
+      const [
+        myAppointments, pendingAppointments,
+        completedAppointments, myAnalyses, myPatients
+      ] = await Promise.all([
+        Appointment.countDocuments({ doctor: userId }),
+        Appointment.countDocuments({ doctor: userId, status: 'pending' }),
+        Appointment.countDocuments({ doctor: userId, status: 'completed' }),
+        AIAnalysis.countDocuments({ doctor: userId }),
+        Appointment.distinct('patient', { doctor: userId })
+      ]);
 
       stats = {
         myAppointments,
@@ -167,30 +234,24 @@ const getDashboardStats = async (req, res, next) => {
         totalPatients: myPatients.length
       };
     } else if (role === 'patient') {
-      const Appointment = getAppointmentModel();
-      const Report = getReportModel();
-      const AIAnalysis = getAIAnalysisModel();
-      const myAppointments = await Appointment.countDocuments({ patient: userId });
-      const upcomingAppointments = await Appointment.countDocuments({ 
-        patient: userId, 
-        status: { $in: ['pending', 'confirmed'] },
-        appointmentDate: { $gte: new Date() }
-      });
-      const myReports = await Report.countDocuments({ patient: userId });
-      const myAnalyses = await AIAnalysis.countDocuments({ patient: userId });
+      const [myAppointments, upcomingAppointments, myReports, myAnalyses] = await Promise.all([
+        Appointment.countDocuments({ patient: userId }),
+        Appointment.countDocuments({
+          patient: userId,
+          status: { $in: ['pending', 'confirmed'] },
+          appointmentDate: { $gte: new Date() }
+        }),
+        Report.countDocuments({ patient: userId }),
+        AIAnalysis.countDocuments({ patient: userId })
+      ]);
 
-      stats = {
-        myAppointments,
-        upcomingAppointments,
-        myReports,
-        myAnalyses
-      };
+      stats = { myAppointments, upcomingAppointments, myReports, myAnalyses };
     }
 
-    res.json({
-      success: true,
-      stats
-    });
+    setCache(cacheKey, stats);
+    logger.info('Stats cache set', { cacheKey, userId });
+
+    res.json({ success: true, stats, fromCache: false });
   } catch (error) {
     next(error);
   }
@@ -237,5 +298,6 @@ module.exports = {
   updateUser,
   deleteUser,
   getDashboardStats,
-  getHealthTrends
+  getHealthTrends,
+  clearStatsCache
 };

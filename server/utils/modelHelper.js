@@ -65,6 +65,36 @@ const findUserWithPassword = async (query) => {
   }
 };
 
+
+//  In memory aggregation  
+const aggregateInMemory = (store, pipeline) => {
+
+  let docs = store.data ? [...store.data] : [];
+
+  for (const stage of pipeline) {
+    if (stage.$match) {
+      const conditions = stage.$match;
+      docs = docs.filter(doc =>
+        Object.entries(conditions).every(([key, val]) => doc[key] === val)
+      );
+    }
+    if (stage.$count) {
+      return [{ [stage.$count]: docs.length }];
+    }
+    if (stage.$group) {
+      const groupField = stage.$group._id?.replace('$', '');
+      const groups = {};
+      for (const doc of docs) {
+        const key = doc[groupField] ?? '__null__';
+        groups[key] = (groups[key] || 0) + 1;
+      }
+      docs = Object.entries(groups).map(([k, count]) => ({ _id: k, count }));
+    }
+  }
+  return docs;
+};
+
+
 module.exports = {
   getUserModel,
   getAppointmentModel,
@@ -72,6 +102,7 @@ module.exports = {
   getAIAnalysisModel,
   populateReference,
   populateReferences,
-  findUserWithPassword
+  findUserWithPassword,
+  aggregateInMemory
 };
 

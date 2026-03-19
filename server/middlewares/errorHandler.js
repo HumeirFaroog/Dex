@@ -1,3 +1,4 @@
+const logger = require('../utils/logger.js');
 const errorHandler = (err, req, res, next) => {
   let error = { ...err };
   error.message = err.message;
@@ -22,6 +23,22 @@ const errorHandler = (err, req, res, next) => {
     const message = Object.values(err.errors).map(val => val.message).join(', ');
     error = { message, statusCode: 400 };
   }
+
+  //JWT errors 
+
+  if (err.name === 'JsonWebTokenError') {
+    statusCode = 401;
+    message = 'Invalid token';
+  }
+
+  if (err.name === 'TokenExpiredError') {
+    statusCode = 401;
+    message = 'Token expired';
+  }
+
+  // Centralized structured log
+  
+  logger.logRequest(message, req, err);
 
   res.status(error.statusCode || 500).json({
     success: false,
